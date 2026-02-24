@@ -1,0 +1,145 @@
+name: E2E Test Runner
+
+on:
+  repository_dispatch:
+    types: [run-e2e-tests]
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  e2e-tests:
+    name: Run E2E Tests with Coverage
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout E2E repo
+        uses: actions/checkout@v4
+
+      - name: Checkout source repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.client_payload.source_repo }}
+          ref: ${{ github.event.client_payload.commit_sha }}
+          path: source-app
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install E2E dependencies
+        working-directory: ${{ github.workspace }}
+        run: npm ci
+
+      - name: Install source app dependencies
+        working-directory: ${{ github.workspace }}/source-app
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Determine impacted tests
+        id: impacted-tests
+        run: |
+          TESTS=$(npx tsx scripts/find-impacted-tests.ts "${{ github.event.client_payload.changed_files }}")
+          echo "tests=$TESTS" >> $GITHUB_OUTPUT
+          echo "Impacted tests: $TESTS"
+
+      - name: Start source app in background
+        working-directory: ${{ github.workspace }}/source-app
+        run: |
+          npm run dev &
+          # Wait for server to be ready
+          npx wait-on http://localhost:5173 --timeout 60000
+
+      - name: Run Playwright tests with coverage
+        id: playwright
+        env:
+          CI: true
+        run: |
+          TESTS="${{ steps.impacted-tests.outputs.tests }}"
+          if [ -z "$TESTS" ]; then
+            TESTS="tests/"
+          fi
+          echo "Running tests: $TESTS"
+          npx playwright test $TESTS
+
+      - name: Analyze coverage
+        id: coverage
+        continue-on-error: true
+        run: |
+          RESULT=$(npx tsx scripts/analyze-coverage.ts coverage/coverage-final.json coverage-baseline)
+          echo "result=$RESULT" >> $GITHUB_OUTPUT
+          echo "$RESULT"
+          # Save as new baseline
+          npx tsx -e "import('./scripts/analyze-coverage.js').then(m => m.saveBaseline('coverage/coverage-final.json', 'coverage-baseline'))"
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-coverage-report
+          path: coverage-html/
+          retention-days: 7
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-test-results
+          path: test-results/
+          retention-days: 7
+
+      - name: Parse coverage result
+        id: parse-coverage
+        run: |
+          COVERAGE_RESULT='${{ steps.coverage.outputs.result }}'
+          PASSED=$(echo "$COVERAGE_RESULT" | jq -r '.passed // false')
+          DESCRIPTION=$(echo "$COVERAGE_RESULT" | jq -r '.reason // .description // "Coverage check passed"')
+          echo "passed=$PASSED" >> $GITHUB_OUTPUT
+          echo "description=$DESCRIPTION" >> $GITHUB_OUTPUT
+
+      - name: Post coverage status
+        if: always()
+        run: |
+          STATE='${{ steps.playwright.outcome == "success" && steps.parse-coverage.outputs.passed == "true" && "success" || "failure" }}'
+          DESCRIPTION="${{ steps.parse-coverage.outputs.description }}"
+          TARGET_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          npx tsx scripts/post-status.ts \
+            "${{ github.event.client_payload.source_repo }}" \
+            "${{ github.event.client_payload.commit_sha }}" \
+            "${{ secrets.SOURCE_PAT }}" \
+            "e2e/coverage" \
+            "$STATE" \
+            "$DESCRIPTION" \
+            "$TARGET_URL"
+
+      - name: Post test status
+        if: always()
+        run: |
+          STATE='${{ steps.playwright.outcome }}'
+          DESCRIPTION="E2E tests $STATE"
+
+          if [ "$STATE" = "success" ]; then
+            STATE="success"
+            DESCRIPTION="All E2E tests passed"
+          elif [ "$STATE" = "failure" ]; then
+            STATE="failure"
+            DESCRIPTION="Some E2E tests failed"
+          else
+            STATE="error"
+            DESCRIPTION="E2E tests encountered an error"
+          fi
+
+          TARGET_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          npx tsx scripts/post-status.ts \
+            "${{ github.event.client_payload.source_repo }}" \
+            "${{ github.event.client_payload.commit_sha }}" \
+            "${{ secrets.SOURCE_PAT }}" \
+            "e2e/tests" \
+            "$STATE" \
+            "$DESCRIPTION" \
+            "$TARGET_URL"
