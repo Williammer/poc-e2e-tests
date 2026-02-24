@@ -46,11 +46,13 @@ export default defineConfig({
   workers: process.env.CI ? 1 : 4,
   reporter: reporters,
   // Start the Vite dev server before running tests
+  // In CI, the server is started by the workflow, so we just reuse it
+  // Locally, we start the server automatically
   webServer: {
     command: 'cd ../poc-source-app && npm run dev',
     url: 'http://localhost:5173',
     timeout: 120000,
-    reuseExistingServer: !process.env.CI,
+    reuseExistingServer: true, // Always reuse existing server (for CI compatibility)
   },
   use: {
     screenshot: 'only-on-failure',
