@@ -4,13 +4,55 @@ on:
   repository_dispatch:
     types: [run-e2e-tests]
 
+permissions:
+  contents: read
+  statuses: write
+
 env:
   NODE_VERSION: '20'
 
 jobs:
+  validate-payload:
+    name: Validate Required Payload
+    runs-on: ubuntu-latest
+    outputs:
+      source-repo: ${{ steps.validate.outputs.source-repo }}
+      commit-sha: ${{ steps.validate.outputs.commit-sha }}
+      payload-valid: ${{ steps.validate.outputs.payload-valid }}
+    steps:
+      - name: Validate required fields
+        id: validate
+        run: |
+          REQUIRED_FIELDS=("source_repo" "commit_sha" "pr_number")
+          VALID="true"
+
+          for field in "${REQUIRED_FIELDS[@]}"; do
+            VALUE='${{ github.event.client_payload.source_repo }}'
+            if [ "$field" = "commit_sha" ]; then
+              VALUE='${{ github.event.client_payload.commit_sha }}'
+            elif [ "$field" = "pr_number" ]; then
+              VALUE='${{ github.event.client_payload.pr_number }}'
+            fi
+
+            if [ -z "$VALUE" ]; then
+              echo "Missing required field: $field"
+              VALID="false"
+            fi
+          done
+
+          if [ -z "${{ secrets.SOURCE_PAT }}" ]; then
+            echo "Missing SOURCE_PAT secret"
+            VALID="false"
+          fi
+
+          echo "payload-valid=$VALID" >> $GITHUB_OUTPUT
+          echo "source-repo=${{ github.event.client_payload.source_repo }}" >> $GITHUB_OUTPUT
+          echo "commit-sha=${{ github.event.client_payload.commit_sha }}" >> $GITHUB_OUTPUT
+
   e2e-tests:
     name: Run E2E Tests with Coverage
     runs-on: ubuntu-latest
+    needs: validate-payload
 
     steps:
       - name: Checkout E2E repo
@@ -19,8 +61,8 @@ jobs:
       - name: Checkout source repo
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.event.client_payload.source_repo }}
-          ref: ${{ github.event.client_payload.commit_sha }}
+          repository: ${{ needs.validate-payload.outputs.source-repo }}
+          ref: ${{ needs.validate-payload.outputs.commit-sha }}
           path: source-app
 
       - name: Setup Node.js
@@ -42,7 +84,7 @@ jobs:
       - name: Determine impacted tests
         id: impacted-tests
         run: |
-          TESTS=$(npx tsx scripts/find-impacted-tests.ts "${{ github.event.client_payload.changed_files }}")
+          TESTS=$(npx tsx scripts/find-impacted-tests.ts "${{ github.event.client_payload.changed_files }}" || echo "")
           echo "tests=$TESTS" >> $GITHUB_OUTPUT
           echo "Impacted tests: $TESTS"
 
@@ -50,6 +92,8 @@ jobs:
         working-directory: ${{ github.workspace }}/source-app
         run: |
           npm run dev &
+          SERVER_PID=$!
+          echo "server_pid=$SERVER_PID" >> $GITHUB_OUTPUT
           # Wait for server to be ready
           npx wait-on http://localhost:5173 --timeout 60000
 
@@ -65,15 +109,44 @@ jobs:
           echo "Running tests: $TESTS"
           npx playwright test $TESTS
 
+      - name: Stop source app
+        if: always()
+        run: |
+          if [ -n "${{ steps.impacted-tests.outputs.server_pid }}" ]; then
+            kill ${{ steps.impacted-tests.outputs.server_pid }} 2>/dev/null || true
+          fi
+          pkill -f "vite" || true
+
+      - name: Download coverage baseline
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-baseline
+          path: .
+
       - name: Analyze coverage
         id: coverage
         continue-on-error: true
         run: |
-          RESULT=$(npx tsx scripts/analyze-coverage.ts coverage/coverage-final.json coverage-baseline)
+          if [ -f "coverage-baseline/baseline.json" ]; then
+            RESULT=$(npx tsx scripts/analyze-coverage.ts coverage/coverage-final.json coverage-baseline/baseline.json 2>&1) || RESULT='{"passed":false,"description":"Coverage analysis failed"}'
+          else
+            echo "No baseline found, creating new baseline"
+            RESULT='{"passed":true,"description":"New baseline established"}'
+          fi
           echo "result=$RESULT" >> $GITHUB_OUTPUT
           echo "$RESULT"
           # Save as new baseline
-          npx tsx -e "import('./scripts/analyze-coverage.js').then(m => m.saveBaseline('coverage/coverage-final.json', 'coverage-baseline'))"
+          npx tsx scripts/save-baseline.ts coverage/coverage-final.json baseline-new || true
+
+      - name: Upload new baseline
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-baseline
+          path: baseline-new/
+          retention-days: 30
+          overwrite: true
 
       - name: Upload coverage report
         if: always()
@@ -95,21 +168,31 @@ jobs:
         id: parse-coverage
         run: |
           COVERAGE_RESULT='${{ steps.coverage.outputs.result }}'
-          PASSED=$(echo "$COVERAGE_RESULT" | jq -r '.passed // false')
-          DESCRIPTION=$(echo "$COVERAGE_RESULT" | jq -r '.reason // .description // "Coverage check passed"')
+          if echo "$COVERAGE_RESULT" | jq -e . >/dev/null 2>&1; then
+            PASSED=$(echo "$COVERAGE_RESULT" | jq -r '.passed // false')
+            DESCRIPTION=$(echo "$COVERAGE_RESULT" | jq -r '.reason // .description // "Coverage check passed"')
+          else
+            PASSED="false"
+            DESCRIPTION="Coverage analysis produced invalid output"
+          fi
           echo "passed=$PASSED" >> $GITHUB_OUTPUT
           echo "description=$DESCRIPTION" >> $GITHUB_OUTPUT
 
       - name: Post coverage status
         if: always()
         run: |
-          STATE='${{ steps.playwright.outcome == "success" && steps.parse-coverage.outputs.passed == "true" && "success" || "failure" }}'
+          if [ "${{ steps.playwright.outcome }}" = "success" ] && [ "${{ steps.parse-coverage.outputs.passed }}" = "true" ]; then
+            STATE="success"
+          else
+            STATE="failure"
+          fi
+
           DESCRIPTION="${{ steps.parse-coverage.outputs.description }}"
           TARGET_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           npx tsx scripts/post-status.ts \
-            "${{ github.event.client_payload.source_repo }}" \
-            "${{ github.event.client_payload.commit_sha }}" \
+            "${{ needs.validate-payload.outputs.source-repo }}" \
+            "${{ needs.validate-payload.outputs.commit-sha }}" \
             "${{ secrets.SOURCE_PAT }}" \
             "e2e/coverage" \
             "$STATE" \
@@ -119,25 +202,32 @@ jobs:
       - name: Post test status
         if: always()
         run: |
-          STATE='${{ steps.playwright.outcome }}'
-          DESCRIPTION="E2E tests $STATE"
+          STATE="${{ steps.playwright.outcome }}"
 
-          if [ "$STATE" = "success" ]; then
-            STATE="success"
-            DESCRIPTION="All E2E tests passed"
-          elif [ "$STATE" = "failure" ]; then
-            STATE="failure"
-            DESCRIPTION="Some E2E tests failed"
-          else
-            STATE="error"
-            DESCRIPTION="E2E tests encountered an error"
-          fi
+          case "$STATE" in
+            success)
+              STATE="success"
+              DESCRIPTION="All E2E tests passed"
+              ;;
+            failure)
+              STATE="failure"
+              DESCRIPTION="Some E2E tests failed"
+              ;;
+            cancelled)
+              STATE="error"
+              DESCRIPTION="E2E tests were cancelled"
+              ;;
+            *)
+              STATE="error"
+              DESCRIPTION="E2E tests encountered an error"
+              ;;
+          esac
 
           TARGET_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           npx tsx scripts/post-status.ts \
-            "${{ github.event.client_payload.source_repo }}" \
-            "${{ github.event.client_payload.commit_sha }}" \
+            "${{ needs.validate-payload.outputs.source-repo }}" \
+            "${{ needs.validate-payload.outputs.commit-sha }}" \
             "${{ secrets.SOURCE_PAT }}" \
             "e2e/tests" \
             "$STATE" \
