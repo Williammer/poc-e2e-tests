@@ -45,6 +45,13 @@ export default defineConfig({
   retries: process.env.CI ? 2 : 0,
   workers: process.env.CI ? 1 : 4,
   reporter: reporters,
+  // Start the Vite dev server before running tests
+  webServer: {
+    command: 'cd ../poc-source-app && npm run dev',
+    url: 'http://localhost:5173',
+    timeout: 120000,
+    reuseExistingServer: !process.env.CI,
+  },
   use: {
     screenshot: 'only-on-failure',
     video: 'retain-on-failure',
