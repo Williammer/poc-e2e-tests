@@ -69,16 +69,41 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Cache E2E dependencies
+        uses: actions/cache@v4
+        id: e2e-cache
+        with:
+          path: |
+            node_modules
+            ~/.cache/ms-playwright
+          key: ${{ runner.os }}-e2e-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-e2e-
+
+      - name: Cache source app dependencies
+        uses: actions/cache@v4
+        id: source-cache
+        with:
+          path: |
+            source-app/node_modules
+          key: ${{ runner.os }}-source-${{ hashFiles('source-app/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-source-
 
       - name: Install E2E dependencies
+        if: steps.e2e-cache.outputs.cache-hit != 'true'
         working-directory: ${{ github.workspace }}
         run: npm ci
 
       - name: Install source app dependencies
+        if: steps.source-cache.outputs.cache-hit != 'true'
         working-directory: ${{ github.workspace }}/source-app
         run: npm ci
 
       - name: Install Playwright browsers
+        if: steps.e2e-cache.outputs.cache-hit != 'true'
         run: npx playwright install --with-deps chromium
 
       - name: Determine impacted tests
